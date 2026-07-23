@@ -39,3 +39,8 @@ jobs:
           projectName: finance-dashboard
           directory: dist
           gitHubToken: ${{ secrets.GITHUB_TOKEN }}
+
+permissions:
+  contents: read
+  deployments: write
+
