@@ -752,13 +752,15 @@ def main():
     html = generate_html(all_data)
 
     # 10. 写入文件
-     out_dir = os.environ.get("OUTPUT_DIR", "dist")
+    # 10. 写入文件
+    out_dir = os.environ.get("OUTPUT_DIR", "dist")
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "index.html")
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(html)
 
     print(f"[完成] HTML 已生成: {out_path} ({len(html)} bytes)")
+
     print(f"[数据统计] 行情:{len(all_data['quotes'])} 板块:{len(all_data['sectors'])} "
           f"宏观:{len(all_data['macro'])} "
           f"breadth:{'Y' if all_data['breadth'] else 'N'} "
