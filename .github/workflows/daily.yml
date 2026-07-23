@@ -2,31 +2,32 @@ name: Daily Finance Dashboard
 
 on:
   schedule:
-    # UTC 01:00 = 北京时间 09:00
-    - cron: '0 1 * * *'
-  workflow_dispatch: # 支持手动触发
+    - cron: '0 1 * * *'  # UTC 01:00 = 北京时间 09:00
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  deployments: write
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: Generate dashboard
         run: python dashboard.py
-        env:
-          OUTPUT_PATH: index.html
 
       - name: Deploy to Cloudflare Pages
         uses: cloudflare/pages-action@v1
@@ -34,5 +35,4 @@ jobs:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           projectName: finance-dashboard
-          directory: .
-          gitHubToken: ${{ secrets.GITHUB_TOKEN }}
+          directory: dist
