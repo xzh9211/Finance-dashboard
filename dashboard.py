@@ -976,31 +976,32 @@ CRYPTO_FALLBACK = {
 CSS = """
 :root{--bg:#f5f6fa;--card:#fff;--text:#1a1a2e;--sub:#5a5a7a;--up:#c0392b;--down:#27ae60;--accent:#2c3e50;--border:#e0e0e8;--warn:#e74c3c;--safe:#3498db;--gold:#f1c40f}
 *{margin:0;padding:0;box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
 body{font-family:'PingFang SC','Microsoft YaHei','Helvetica Neue',Arial,sans-serif;background:var(--bg);color:var(--text);line-height:1.6;padding:16px}
-.container{max-width:1280px;margin:auto}
+.container{max-width:1280px;margin:auto;padding:0 4px}
 .header{text-align:center;padding:24px 0 12px}
-.header h1{font-size:28px;color:var(--accent);margin-bottom:4px}
+.header h1{font-size:28px;color:var(--accent);margin-bottom:6px}
 .header .date{font-size:14px;color:var(--sub)}
 .conclusion-card{background:linear-gradient(135deg,#2c3e50,#34495e);color:#fff;border-radius:12px;padding:24px;margin:16px 0;box-shadow:0 4px 12px rgba(0,0,0,.15)}
 .conclusion-card .title{font-size:18px;font-weight:700;margin-bottom:12px}
-.conclusion-card .summary{font-size:16px;line-height:1.8;margin-bottom:12px}
+.conclusion-card .summary{font-size:16px;line-height:1.8;margin-bottom:12px;word-break:break-word}
 .conclusion-card .signals{display:flex;flex-wrap:wrap;gap:8px}
-.conclusion-card .signal{background:rgba(255,255,255,.18);padding:6px 14px;border-radius:6px;font-size:13px}
+.conclusion-card .signal{background:rgba(255,255,255,.18);padding:6px 14px;border-radius:6px;font-size:13px;white-space:nowrap}
 .signal.up{border-left:3px solid #e74c3c}
 .signal.down{border-left:3px solid #2ecc71}
 .signal.neutral{border-left:3px solid #3498db}
 .section{margin:20px 0}
 .section-title{font-size:20px;font-weight:700;color:var(--accent);padding:8px 0;border-bottom:2px solid var(--accent);margin-bottom:16px}
-.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:12px}
-.card{background:var(--card);border-radius:10px;padding:16px;border:1px solid var(--border);box-shadow:0 2px 6px rgba(0,0,0,.06);transition:transform .2s}
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px}
+.card{background:var(--card);border-radius:10px;padding:16px;border:1px solid var(--border);box-shadow:0 2px 6px rgba(0,0,0,.06);transition:transform .2s;word-break:break-word;min-width:0}
 .card:hover{transform:translateY(-2px)}
-.card .label{font-size:12px;color:var(--sub);margin-bottom:4px}
-.card .value{font-size:22px;font-weight:700}
-.card .change{font-size:13px;margin-top:4px}
+.card .label{font-size:12px;color:var(--sub);margin-bottom:4px;line-height:1.4}
+.card .value{font-size:22px;font-weight:700;line-height:1.3}
+.card .change{font-size:13px;margin-top:4px;display:block}
 .card .change.up{color:var(--up)}
 .card .change.down{color:var(--down)}
-.card .extra{font-size:12px;color:var(--sub);margin-top:6px}
-.chart-box{background:var(--card);border-radius:10px;padding:16px;border:1px solid var(--border);margin:16px 0;height:420px}
+.card .extra{font-size:12px;color:var(--sub);margin-top:6px;line-height:1.4}
+.chart-box{background:var(--card);border-radius:10px;padding:16px;border:1px solid var(--border);margin:16px 0;height:380px;overflow:hidden}
 .chart-title{font-size:16px;font-weight:700;color:var(--accent);margin-bottom:8px}
 .row{display:flex;gap:12px;margin:8px 0}
 .row .card{flex:1}
@@ -1008,10 +1009,54 @@ body{font-family:'PingFang SC','Microsoft YaHei','Helvetica Neue',Arial,sans-ser
 .tag.up{background:#fce4ec;color:var(--up)}
 .tag.down{background:#e8f5e9;color:var(--down)}
 .tag.neutral{background:#e3f2fd;color:var(--safe)}
-.footer{text-align:center;padding:24px 0;font-size:12px;color:var(--sub)}
+.footer{text-align:center;padding:24px 0;font-size:12px;color:var(--sub);line-height:1.8}
 .note{font-size:11px;color:#888;margin-top:4px}
-@media(max-width:768px){.cards{grid-template-columns:1fr 1fr}.chart-box{height:300px}}
-@media(max-width:480px){.cards{grid-template-columns:1fr}.container{padding:8px}}
+
+/* 平板 */
+@media(max-width:900px){
+  .cards{grid-template-columns:repeat(2,1fr)}
+  .chart-box{height:340px}
+}
+
+/* 大手机/小平板 */
+@media(max-width:768px){
+  body{padding:12px}
+  .header{padding:18px 0 8px}
+  .header h1{font-size:22px}
+  .header .date{font-size:12px}
+  .section-title{font-size:16px;margin-bottom:12px}
+  .cards{grid-template-columns:repeat(2,1fr);gap:10px}
+  .card{padding:12px}
+  .card .value{font-size:18px}
+  .card .change,.card .extra,.card .label{font-size:11px}
+  .chart-box{height:300px;padding:12px}
+  .chart-title{font-size:14px}
+  .conclusion-card{padding:16px}
+  .conclusion-card .title{font-size:15px}
+  .conclusion-card .summary{font-size:14px;line-height:1.7}
+  .conclusion-card .signal{font-size:12px;padding:5px 10px}
+  .footer{padding:18px 0;font-size:11px}
+}
+
+/* 小手机 */
+@media(max-width:480px){
+  body{padding:8px}
+  .container{padding:0}
+  .header{padding:14px 0 6px}
+  .header h1{font-size:20px}
+  .cards{grid-template-columns:1fr}
+  .chart-box{height:260px;margin:12px 0}
+  .conclusion-card{margin:12px 0;padding:14px}
+  .conclusion-card .signals{gap:6px}
+  .section{margin:16px 0}
+}
+
+/* 超小屏折叠屏 */
+@media(max-width:360px){
+  .header h1{font-size:18px}
+  .card .value{font-size:16px}
+  .chart-box{height:240px}
+}
 """
 
 
@@ -1490,11 +1535,11 @@ def generate_html(d):
 <div class="cards">{risk_cards}</div>
 </div>
 
-<div class="chart-box"><div class="chart-title">主要指数涨跌幅 (%)</div><div id="chart1" style="width:100%;height:360px"></div></div>
-<div class="chart-box"><div class="chart-title">外部资产涨跌幅 (%)</div><div id="chart2" style="width:100%;height:360px"></div></div>
-<div class="chart-box"><div class="chart-title">行业板块涨跌幅 Top (%)</div><div id="chart3" style="width:100%;height:360px"></div></div>
-<div class="chart-box"><div class="chart-title">美债收益率曲线 (%)</div><div id="chart4" style="width:100%;height:360px"></div></div>
-<div class="chart-box"><div class="chart-title">风险指标</div><div id="chart5" style="width:100%;height:360px"></div></div>
+<div class="chart-box"><div class="chart-title">主要指数涨跌幅 (%)</div><div id="chart1" style="width:100%;min-height:240px"></div></div>
+<div class="chart-box"><div class="chart-title">外部资产涨跌幅 (%)</div><div id="chart2" style="width:100%;min-height:240px"></div></div>
+<div class="chart-box"><div class="chart-title">行业板块涨跌幅 Top (%)</div><div id="chart3" style="width:100%;min-height:240px"></div></div>
+<div class="chart-box"><div class="chart-title">美债收益率曲线 (%)</div><div id="chart4" style="width:100%;min-height:240px"></div></div>
+<div class="chart-box"><div class="chart-title">风险指标</div><div id="chart5" style="width:100%;min-height:240px"></div></div>
 
 <div class="footer">
 <p>数据来源: 东方财富(push2/datacenter) / 新浪财经 / Yahoo Finance / CoinGecko / Alternative.me | GitHub Actions 每日自动生成 | Cloudflare Pages 托管</p>
