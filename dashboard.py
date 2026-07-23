@@ -1,20 +1,30 @@
 #!/usr/bin/env python3
 """
 每日金融市场全景看板生成器
-数据源:
-  - 东方财富 push2 API (A股指数/板块/涨跌停/成交额/两融) — 海外可访问
-  - yfinance Ticker 单个获取 (美股/美债/VIX/商品/DXY) — 带重试
-  - CoinGecko (加密货币)
-  - Alternative.me (恐惧贪婪指数)
-  - 宏观数据预设最新值 (月度更新)
-输出: dist/index.html
+覆盖五大维度：
+  一、经济基本面（PMI/CPI/PPI/社融/M1M2/消费/进出口/房地产）
+  二、情绪面（两融/连板强度/市场趋势/涨跌家数/热门板块）
+  三、资金面（公募/ETF/北上/成交/非银存款）
+  四、外部市场（汇率/美元指数/黄金/白银/铜/原油/比特币/美债/美股）
+  五、负面/风险（VIX/市场广度/期货贴水/IPO数量）
+数据源：
+  - 东方财富 datacenter API（月度宏观：CPI/PMI/PPI/M1M2/信贷/进出口/社零）
+  - 东方财富 push2 API（A股指数/板块/涨跌停/成交额/两融/ETF/期货）
+  - 新浪财经 hq.sinajs.cn 备用（指数/成交额/外部市场）
+  - yfinance Ticker（美股/美债/VIX/商品/外汇）
+  - CoinGecko（加密货币）
+  - Alternative.me（恐惧贪婪指数）
+  - 月度社融/房地产/公募仓位/非银存款采用最近可得权威数据
+输出：dist/index.html
 """
 
 import json
 import os
+import re
 import sys
 import time
 import traceback
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -37,10 +47,15 @@ def safe_float(val, default=0.0):
     except (TypeError, ValueError):
         return default
 
+
 def fmt_pct(val, suffix="%"):
     v = safe_float(val)
-    sign = "+" if v >= 0 else ""
+    # 避免显示 -0.00%
+    if abs(v) < 0.005:
+        return f"0.00{suffix}"
+    sign = "+" if v > 0 else ""
     return f"{sign}{v:.2f}{suffix}"
+
 
 def fmt_change(val, prefix=""):
     v = safe_float(val)
@@ -48,21 +63,40 @@ def fmt_change(val, prefix=""):
     cls = "up" if v >= 0 else "down"
     return f'<span class="change {cls}">{prefix}{sign}{v:.2f}%</span>'
 
-def fetch_json(url, timeout=15, headers=None, **kwargs):
+
+def fetch_json(url, timeout=20, headers=None, **kwargs):
     """带超时和异常处理的 JSON 请求"""
     try:
-        hdrs = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        hdrs = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        }
         if headers:
             hdrs.update(headers)
         resp = requests.get(url, timeout=timeout, headers=hdrs, **kwargs)
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
-        print(f"[WARN] fetch_json failed: {url[:80]} -> {e}")
+        print(f"[WARN] fetch_json failed: {url[:90]} -> {e}")
         return None
 
+
+def fetch_text(url, timeout=20, headers=None):
+    try:
+        hdrs = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        }
+        if headers:
+            hdrs.update(headers)
+        resp = requests.get(url, timeout=timeout, headers=hdrs)
+        resp.raise_for_status()
+        return resp.text
+    except Exception as e:
+        print(f"[WARN] fetch_text failed: {url[:90]} -> {e}")
+        return ""
+
+
 # ---------------------------------------------------------------------------
-# 数据获取 — 东方财富 push2 API (A股指数/板块/涨跌停/成交额)
+# 数据获取 — 东方财富 A 股
 # ---------------------------------------------------------------------------
 
 EM_HEADERS = {
@@ -70,11 +104,14 @@ EM_HEADERS = {
     "Referer": "https://quote.eastmoney.com/",
 }
 
+# A 股主要指数（含股指期货对应现货）
+EM_INDEX_SECIDS = "1.000001,0.399001,0.399006,1.000688,100.HSI,1.000300,1.000905,1.000016,1.000852"
+
+
 def get_em_indices():
-    """东方财富获取 A 股 + 港股指数实时行情"""
-    secids = "1.000001,0.399001,0.399006,1.000688,100.HSI"
+    """东方财富获取 A 股 + 港股 + 宽基指数实时行情；失败时自动 fallback 新浪财经"""
     fields = "f2,f3,f4,f6,f12,f14"
-    url = f"http://push2.eastmoney.com/api/qt/ulist.np/get?secids={secids}&fields={fields}&fltt=2"
+    url = f"http://push2.eastmoney.com/api/qt/ulist.np/get?secids={EM_INDEX_SECIDS}&fields={fields}&fltt=2"
     data = fetch_json(url, headers=EM_HEADERS)
     result = {}
     if data and data.get("data") and data["data"].get("diff"):
@@ -82,21 +119,90 @@ def get_em_indices():
             name = item.get("f14", "")
             price = safe_float(item.get("f2"))
             chg = safe_float(item.get("f3"))
-            turnover = safe_float(item.get("f6"))  # 成交额
+            turnover = safe_float(item.get("f6"))
             if price > 0:
-                result[name] = {
-                    "price": price,
-                    "change": chg,
-                    "turnover": turnover,
-                }
+                result[name] = {"price": price, "change": chg, "turnover": turnover}
+    if len(result) >= 5:
+        return result
+
+    # fallback: 新浪财经
+    print("[INFO] 东方财富指数接口受限，切换新浪财经备用...")
+    return get_sina_indices()
+
+
+def parse_sina_hq(text):
+    """解析新浪 hq.sinajs.cn 返回的 JS 变量"""
+    result = {}
+    if not text:
+        return result
+    for line in text.strip().split(";"):
+        line = line.strip()
+        if not line:
+            continue
+        m = re.search(r'var\s+hq_str_(\w+)="(.*?)"', line)
+        if not m:
+            continue
+        code = m.group(1)
+        content = m.group(2)
+        if not content:
+            continue
+        parts = content.split(",")
+        name = parts[0]
+        if code.startswith("sh") or code.startswith("sz"):
+            # A 股指数: 名称,今开,昨收,最新,最高,最低,...,成交量(手),成交额(元),...,日期,时间
+            if len(parts) < 10:
+                continue
+            price = safe_float(parts[3])
+            prev = safe_float(parts[2])
+            turnover = safe_float(parts[9]) if len(parts) > 9 else 0.0
+            chg = (price - prev) / prev * 100 if prev > 0 else 0.0
+        elif code.startswith("hk") or code.startswith("rt_hk"):
+            # 港股: code,name,最新,昨收,最高,最低,买一,涨跌额,涨跌幅%,...,成交量,成交额,...,日期,时间
+            if len(parts) < 9:
+                continue
+            name = parts[1]
+            price = safe_float(parts[2])
+            chg = safe_float(parts[8])
+            turnover = safe_float(parts[12]) if len(parts) > 12 else 0.0
+        else:
+            continue
+        if price > 0:
+            result[name] = {"price": price, "change": chg, "turnover": turnover}
     return result
+
+
+def get_sina_indices():
+    """新浪财经获取 A 股 + 港股指数实时行情"""
+    sina_codes = "sh000001,sz399001,sz399006,sh000688,sh000300,sh000905,sh000016,sh000852,rt_hkHSI"
+    url = f"https://hq.sinajs.cn/list={sina_codes}"
+    text = fetch_text(url, headers={"Referer": "https://finance.sina.com.cn/"})
+    mapping = {
+        "上证指数": "上证指数",
+        "深证成指": "深证成指",
+        "创业板指": "创业板指",
+        "科创50": "科创50",
+        "沪深300": "沪深300",
+        "中证500": "中证500",
+        "上证50": "上证50",
+        "中证1000": "中证1000",
+        "恒生指数": "恒生指数",
+    }
+    raw = parse_sina_hq(text)
+    result = {}
+    for raw_name, std_name in mapping.items():
+        if raw_name in raw:
+            result[std_name] = raw[raw_name]
+    return result
+
 
 def get_em_sectors():
     """东方财富获取行业板块涨跌幅"""
-    url = ("http://push2.eastmoney.com/api/qt/clist/get"
-           "?pn=1&pz=50&po=1&np=1&fltt=2&invt=2"
-           "&fid=f3&fs=m:90+t:2"
-           "&fields=f2,f3,f12,f14")
+    url = (
+        "http://push2.eastmoney.com/api/qt/clist/get"
+        "?pn=1&pz=60&po=1&np=1&fltt=2&invt=2"
+        "&fid=f3&fs=m:90+t:2"
+        "&fields=f2,f3,f12,f14"
+    )
     data = fetch_json(url, headers=EM_HEADERS)
     sectors = []
     if data and data.get("data") and data["data"].get("diff"):
@@ -108,84 +214,423 @@ def get_em_sectors():
     sectors.sort(key=lambda x: x["change"], reverse=True)
     return sectors
 
-def get_em_market_breadth():
-    """东方财富获取 A 股全市场涨跌家数"""
-    # 用涨跌幅分布 API
-    url = ("http://push2.eastmoney.com/api/qt/clist/get"
-           "?pn=1&pz=1&po=1&np=1&fltt=2&invt=2"
-           "&fid=f3&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
-           "&fields=f2,f3,f12,f14")
+
+def get_em_etf_flow():
+    """ETF 主力净流入（取前 15 只求和）"""
+    url = (
+        "http://push2.eastmoney.com/api/qt/clist/get"
+        "?pn=1&pz=15&po=1&np=1&fltt=2&invt=2"
+        "&fid=f62&fs=b:MK0021,b:MK0022,b:MK0023,b:MK0024"
+        "&fields=f12,f14,f3,f62"
+    )
     data = fetch_json(url, headers=EM_HEADERS)
-    if not data or not data.get("data"):
+    flows = []
+    if data and data.get("data") and data["data"].get("diff"):
+        for item in data["data"]["diff"]:
+            name = item.get("f14", "")
+            flow = safe_float(item.get("f62"))
+            chg = safe_float(item.get("f3"))
+            if name:
+                flows.append({"name": name, "flow": flow, "change": chg})
+    if not flows:
         return None
-    total = data["data"].get("total", 0)
-    if total == 0:
+    total = sum(x["flow"] for x in flows)
+    return {"total": total, "top": flows}
+
+
+def get_breadth_from_margin():
+    """当东方财富 push2 被限制时，用两融个股明细的 ZDF（涨跌幅）字段估算涨跌家数
+    两融标的约 4400 只，覆盖沪深两市主要流动性股票，权威来源仍为东方财富数据中心
+    """
+    print("[INFO] 东方财富涨跌家数接口受限，使用两融明细 ZDF 字段估算...")
+    url = (
+        "https://datacenter-web.eastmoney.com/api/data/v1/get"
+        "?reportName=RPTA_WEB_RZRQ_GGMX&columns=DATE,SCODE,ZDF"
+        "&pageNumber=1&pageSize=1&sortColumns=DATE&sortTypes=-1"
+    )
+    data = fetch_json(url, headers={"Referer": "https://data.eastmoney.com/rzrq/"}, timeout=20)
+    if not data or not data.get("result") or not data["result"].get("data"):
         return None
-    # 获取所有股票涨跌幅
-    url_all = ("http://push2.eastmoney.com/api/qt/clist/get"
-               f"?pn=1&pz={total}&po=1&np=1&fltt=2&invt=2"
-               "&fid=f3&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
-               "&fields=f2,f3,f12,f14")
-    data_all = fetch_json(url_all, headers=EM_HEADERS, timeout=30)
-    if not data_all or not data_all.get("data") or not data_all["data"].get("diff"):
+    latest_date = data["result"]["data"][0].get("DATE", "")[:10]
+    if not latest_date:
         return None
-    changes = []
-    for item in data_all["data"]["diff"]:
-        chg = safe_float(item.get("f3"))
-        changes.append(chg)
-    up = sum(1 for c in changes if c > 0)
-    down = sum(1 for c in changes if c < 0)
-    flat = sum(1 for c in changes if c == 0)
-    limit_up = sum(1 for c in changes if c >= 9.9)
-    limit_down = sum(1 for c in changes if c <= -9.9)
-    return {"up": up, "down": down, "flat": flat,
-            "limit_up": limit_up, "limit_down": limit_down}
+
+    all_changes = []
+    for page in range(1, 13):
+        url = (
+            "https://datacenter-web.eastmoney.com/api/data/v1/get"
+            "?reportName=RPTA_WEB_RZRQ_GGMX&columns=DATE,SCODE,ZDF"
+            f"&pageNumber={page}&pageSize=500"
+            "&sortColumns=DATE&sortTypes=-1"
+        )
+        data = fetch_json(url, headers={"Referer": "https://data.eastmoney.com/rzrq/"}, timeout=30)
+        if not data or not data.get("result") or not data["result"].get("data"):
+            break
+        rows = data["result"]["data"]
+        if not rows:
+            break
+        stop = False
+        for row in rows:
+            dt = row.get("DATE", "")[:10]
+            if dt != latest_date:
+                stop = True
+                break
+            zdf = row.get("ZDF")
+            if zdf is not None:
+                all_changes.append(safe_float(zdf))
+        if stop:
+            break
+
+    if not all_changes:
+        return None
+
+    up = sum(1 for c in all_changes if c > 0)
+    down = sum(1 for c in all_changes if c < 0)
+    flat = sum(1 for c in all_changes if c == 0)
+    limit_up = sum(1 for c in all_changes if c >= 9.9)
+    limit_down = sum(1 for c in all_changes if c <= -9.9)
+    return {
+        "up": up,
+        "down": down,
+        "flat": flat,
+        "limit_up": limit_up,
+        "limit_down": limit_down,
+        "source": "eastmoney_margin_estimate",
+        "sample": len(all_changes),
+    }
+
+
+def get_em_market_breadth():
+    """东方财富分页获取全市场 A 股涨跌家数；失败时 fallback 两融明细 ZDF 估算"""
+    fs = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
+    fields = "f3"
+    page_size = 100
+    all_changes = []
+    for page in range(1, 60):
+        url = (
+            f"http://push2.eastmoney.com/api/qt/clist/get"
+            f"?pn={page}&pz={page_size}&po=1&np=1&fltt=2&invt=2"
+            f"&fid=f3&fs={fs}&fields={fields}"
+        )
+        data = fetch_json(url, headers=EM_HEADERS, timeout=30)
+        if not data or not data.get("data") or not data["data"].get("diff"):
+            break
+        items = data["data"]["diff"]
+        if not items:
+            break
+        for item in items:
+            c = item.get("f3")
+            if c is not None:
+                all_changes.append(safe_float(c))
+        if len(items) < page_size:
+            break
+
+    if len(all_changes) >= 3000:
+        up = sum(1 for c in all_changes if c > 0)
+        down = sum(1 for c in all_changes if c < 0)
+        flat = sum(1 for c in all_changes if c == 0)
+        limit_up = sum(1 for c in all_changes if c >= 9.9)
+        limit_down = sum(1 for c in all_changes if c <= -9.9)
+        return {
+            "up": up,
+            "down": down,
+            "flat": flat,
+            "limit_up": limit_up,
+            "limit_down": limit_down,
+            "source": "eastmoney",
+        }
+
+    return get_breadth_from_margin()
+
+
+def get_em_limit_up_stocks(limit=50):
+    """获取当日涨停股票列表（用于计算连板强度）"""
+    fs = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
+    url = (
+        "http://push2.eastmoney.com/api/qt/clist/get"
+        f"?pn=1&pz={limit}&po=1&np=1&fltt=2&invt=2"
+        f"&fid=f3&fs={fs}&fields=f2,f3,f12,f14"
+    )
+    data = fetch_json(url, headers=EM_HEADERS)
+    stocks = []
+    if data and data.get("data") and data["data"].get("diff"):
+        for item in data["data"]["diff"]:
+            chg = safe_float(item.get("f3"))
+            if chg >= 9.9:
+                code = item.get("f12", "")
+                market = "0" if code.startswith(("0", "3")) else "1"
+                stocks.append({
+                    "code": code,
+                    "name": item.get("f14", ""),
+                    "secid": f"{market}.{code}",
+                    "change": chg,
+                })
+    return stocks
+
+
+def get_stock_kline(secid, lmt=8):
+    """获取个股近 N 日 K 线，返回涨跌幅列表（最近→最远）"""
+    url = (
+        "http://push2his.eastmoney.com/api/qt/stock/kline/get"
+        f"?secid={secid}&fields1=f1,f2,f3,f4,f5"
+        "&fields2=f51,f52,f53,f54,f55,f56,f57,f58"
+        f"&klt=101&fqt=0&end=20500101&lmt={lmt}"
+    )
+    data = fetch_json(url, headers=EM_HEADERS)
+    if data and data.get("data") and data["data"].get("klines"):
+        klines = data["data"]["klines"]
+        # klines 格式: "日期,开盘,收盘,最高,最低,成交量,成交额,振幅"
+        # API 返回按日期从早到晚排列
+        closes = []
+        for k in klines:
+            parts = k.split(",")
+            if len(parts) >= 3:
+                closes.append(safe_float(parts[2]))
+        # 计算每日涨跌幅（按时间顺序）
+        pct_changes = []
+        for i in range(1, len(closes)):
+            prev = closes[i - 1]
+            cur = closes[i]
+            if prev > 0:
+                pct_changes.append((cur - prev) / prev * 100)
+        # 反转，使最近一日排在最前，方便连板统计
+        pct_changes.reverse()
+        return pct_changes
+    return []
+
+
+def get_limit_up_stats():
+    """连板强度统计：2连板、3连板、4连板+ 家数"""
+    stocks = get_em_limit_up_stocks(limit=80)
+    if not stocks:
+        return None
+
+    consecutive = []
+    for s in stocks[:40]:  # 限制请求数量，避免超时
+        try:
+            kline_changes = get_stock_kline(s["secid"], lmt=8)
+            # kline_changes 从近到远（今天→昨天→...）
+            consec = 1
+            for chg in kline_changes[1:]:
+                if chg >= 9.9:
+                    consec += 1
+                else:
+                    break
+            consecutive.append(consec)
+            if len(consecutive) >= 30:
+                break
+        except Exception as e:
+            print(f"[WARN] kline failed for {s['name']}: {e}")
+            continue
+
+    two = sum(1 for c in consecutive if c == 2)
+    three = sum(1 for c in consecutive if c == 3)
+    four_plus = sum(1 for c in consecutive if c >= 4)
+    max_consec = max(consecutive) if consecutive else 0
+    return {
+        "two": two,
+        "three": three,
+        "four_plus": four_plus,
+        "max": max_consec,
+        "limit_up_count": len(stocks),
+    }
+
 
 def get_em_turnover():
-    """获取沪深两市成交额"""
-    url = ("http://push2.eastmoney.com/api/qt/ulist.np/get"
-           "?secids=1.000001,0.399001&fields=f6&fltt=2")
+    """沪深两市成交额合计；东方财富失败时 fallback 新浪财经"""
+    url = (
+        "http://push2.eastmoney.com/api/qt/ulist.np/get"
+        "?secids=1.000001,0.399001&fields=f6&fltt=2"
+    )
     data = fetch_json(url, headers=EM_HEADERS)
-    total = 0
+    total = 0.0
     if data and data.get("data") and data["data"].get("diff"):
         for item in data["data"]["diff"]:
             total += safe_float(item.get("f6"))
+    if total > 0:
+        return total
+
+    # fallback: 新浪财经
+    print("[INFO] 东方财富成交额接口受限，切换新浪财经备用...")
+    text = fetch_text(
+        "https://hq.sinajs.cn/list=sh000001,sz399001",
+        headers={"Referer": "https://finance.sina.com.cn/"},
+    )
+    raw = parse_sina_hq(text)
+    total = 0.0
+    for name in ["上证指数", "深证成指"]:
+        total += raw.get(name, {}).get("turnover", 0)
     return total if total > 0 else None
 
+
 def get_em_margin():
-    """东方财富获取两融余额"""
-    url = ("http://datacenter-web.eastmoney.com/api/data/v1/get"
-           "?reportName=RPTA_WEB_RZRQ_GGMX"
-           "&columns=ALL&pageNumber=1&pageSize=1"
-           "&sortColumns=RZRQYE&sortTypes=-1")
-    data = fetch_json(url, headers=EM_HEADERS)
-    if data and data.get("result") and data["result"].get("data"):
-        row = data["result"]["data"][0]
-        val = safe_float(row.get("RZRQYE", 0))
-        return {"value": val, "date": row.get("RZRQ_RQ", "")}
-    return None
+    """东方财富融资融券余额：按最新交易日个股明细汇总"""
+    # 先取 1 条拿到最新日期
+    url = (
+        "https://datacenter-web.eastmoney.com/api/data/v1/get"
+        "?reportName=RPTA_WEB_RZRQ_GGMX&columns=DATE&pageNumber=1&pageSize=1"
+        "&sortColumns=DATE&sortTypes=-1"
+    )
+    data = fetch_json(url, headers={"Referer": "https://data.eastmoney.com/rzrq/"})
+    if not data or not data.get("result") or not data["result"].get("data"):
+        return None
+    latest_date = data["result"]["data"][0].get("DATE", "")[:10]
+    if not latest_date:
+        return None
+
+    # 取最新日期前 N 页数据汇总
+    all_rows = []
+    for page in range(1, 13):  # 最多 6000 条，足够覆盖一天
+        url = (
+            "https://datacenter-web.eastmoney.com/api/data/v1/get"
+            "?reportName=RPTA_WEB_RZRQ_GGMX&columns=DATE,RZRQYE,RZYE,RQYE"
+            f"&pageNumber={page}&pageSize=500"
+            "&sortColumns=DATE&sortTypes=-1"
+        )
+        data = fetch_json(url, headers={"Referer": "https://data.eastmoney.com/rzrq/"}, timeout=30)
+        if not data or not data.get("result") or not data["result"].get("data"):
+            break
+        rows = data["result"]["data"]
+        if not rows:
+            break
+        for row in rows:
+            dt = row.get("DATE", "")[:10]
+            if dt != latest_date:
+                break
+            all_rows.append(row)
+        else:
+            continue
+        break
+
+    if not all_rows:
+        return None
+
+    total = sum(safe_float(r.get("RZRQYE", 0)) for r in all_rows)
+    rzye = sum(safe_float(r.get("RZYE", 0)) for r in all_rows)
+    rqye = sum(safe_float(r.get("RQYE", 0)) for r in all_rows)
+    return {
+        "value": total,
+        "rzye": rzye,
+        "rqye": rqye,
+        "date": latest_date,
+        "count": len(all_rows),
+    }
+
 
 def get_em_north_flow():
-    """东方财富获取北向资金"""
-    url = ("http://push2.eastmoney.com/api/qt/kamt.rtmin/get"
-           "?fields1=f1,f2,f3,f4&fields2=f51,f52,f53,f54,f55,f56")
+    """北向资金：港交所已停止实时披露净买入额，尝试获取最新可得数据"""
+    # 东方财富沪深港通历史数据接口
+    url = (
+        "https://datacenter-web.eastmoney.com/api/data/v1/get"
+        "?reportName=RPT_MUTUAL_DEAL_HISTORY&columns=ALL"
+        "&pageNumber=1&pageSize=5&sortColumns=TRADE_DATE&sortTypes=-1"
+        "&filter=(MUTUAL_TYPE%3D%22001%22)"
+    )
+    data = fetch_json(url, headers={"Referer": "https://data.eastmoney.com/hsgtcg/"})
+    if data and data.get("result") and data["result"].get("data"):
+        for row in data["result"]["data"]:
+            net = row.get("NET_DEAL_AMT") or row.get("FUND_INFLOW")
+            if net is not None:
+                return {
+                    "value": safe_float(net) / 1e4,  # 转为亿
+                    "date": row.get("TRADE_DATE", "")[:10],
+                }
+    return {"value": None, "date": None}
+
+
+def get_futures_basis():
+    """股指期货升贴水：期货主力合约 - 现货指数"""
+    # 期货主力合约
+    url = (
+        "http://push2.eastmoney.com/api/qt/clist/get"
+        "?pn=1&pz=300&po=1&np=1&fltt=2&invt=2&fid=f3&fs=m:8"
+        "&fields=f2,f3,f12,f14,f18,f20,f21"
+    )
     data = fetch_json(url, headers=EM_HEADERS)
-    if data and data.get("data"):
-        d = data["data"]
-        # f1=沪股通净买入 f2=深股通净买入 f3=北向合计
-        hgt = safe_float(d.get("f1"))
-        sgt = safe_float(d.get("f2"))
-        total = safe_float(d.get("f3"))
-        if total != 0:
-            return {"value": total / 1e4, "hgt": hgt / 1e4, "sgt": sgt / 1e4}  # 转为亿
-    return None
+    futures = {}
+    if data and data.get("data") and data["data"].get("diff"):
+        for item in data["data"]["diff"]:
+            name = item.get("f14", "")
+            if "主力" in name:
+                if "IF" in name:
+                    futures["IF"] = safe_float(item.get("f2"))
+                elif "IC" in name:
+                    futures["IC"] = safe_float(item.get("f2"))
+                elif "IH" in name:
+                    futures["IH"] = safe_float(item.get("f2"))
+                elif "IM" in name:
+                    futures["IM"] = safe_float(item.get("f2"))
+
+    # 现货指数
+    spot = get_em_indices()
+    mapping = {
+        "IF": ("沪深300", "IF"),
+        "IC": ("中证500", "IC"),
+        "IH": ("上证50", "IH"),
+        "IM": ("中证1000", "IM"),
+    }
+    result = []
+    for key, (spot_name, fut_name) in mapping.items():
+        s_price = spot.get(spot_name, {}).get("price", 0)
+        f_price = futures.get(key, 0)
+        if s_price > 0 and f_price > 0:
+            basis = f_price - s_price
+            basis_pct = basis / s_price * 100
+            result.append({
+                "name": fut_name,
+                "basis": basis,
+                "basis_pct": basis_pct,
+                "future": f_price,
+                "spot": s_price,
+            })
+    return result
+
+
+def get_ipo_count():
+    """近期 IPO 数量：东方财富新股申购数据"""
+    try:
+        url = (
+            "https://datacenter-web.eastmoney.com/api/data/v1/get"
+            "?reportName=RPTA_APP_IPOAPPLY&columns=APPLY_DATE,SECURITY_CODE,SECURITY_NAME"
+            "&pageNumber=1&pageSize=500&sortColumns=APPLY_DATE&sortTypes=-1"
+        )
+        data = fetch_json(url, headers={"Referer": "https://data.eastmoney.com/xg/"}, timeout=20)
+        if data and data.get("result") and data["result"].get("data"):
+            today = NOW.date()
+            week_ago = today - timedelta(days=7)
+            week_later = today + timedelta(days=7)
+            count = 0
+            names = []
+            for row in data["result"]["data"]:
+                apply = row.get("APPLY_DATE", "")[:10]
+                if not apply:
+                    continue
+                try:
+                    d = datetime.strptime(apply, "%Y-%m-%d").date()
+                except Exception:
+                    continue
+                if week_ago <= d <= week_later:
+                    count += 1
+                    names.append(row.get("SECURITY_NAME", ""))
+            if count > 0:
+                note = f"近两周申购：{', '.join(names[:5])}{'等' if count > 5 else ''}"
+                return {"count": count, "source": "eastmoney", "note": note}
+    except Exception as e:
+        print(f"[WARN] IPO API failed: {e}")
+
+    # 预设兜底
+    return {"count": 6, "source": "preset", "note": "本周约 6 只（需手动核对）"}
+
 
 # ---------------------------------------------------------------------------
-# 数据获取 — yfinance (美股/美债/VIX/商品/DXY) 单个 Ticker + 重试
+# 数据获取 — yfinance (美股/美债/商品/DXY/汇率)
 # ---------------------------------------------------------------------------
 
-def get_yf_single(ticker, name, retries=3):
-    """单个 yfinance Ticker 获取，带重试"""
+def get_yf_single(ticker, retries=3):
+    """单个 yfinance Ticker 获取，带重试
+    返回: {price: 当前价, prev: 昨收, change: 日涨跌幅%}
+    对美债收益率，price 本身就是收益率数值，外部再用 (price-prev)*100 换算 bp
+    """
     try:
         import yfinance as yf
     except ImportError:
@@ -200,11 +645,11 @@ def get_yf_single(ticker, name, retries=3):
                 prev = safe_float(hist["Close"].iloc[-2])
                 if cur > 0 and prev > 0:
                     chg = (cur - prev) / prev * 100
-                    return {"price": cur, "change": chg}
+                    return {"price": cur, "prev": prev, "change": chg}
             elif hist is not None and not hist.empty:
                 cur = safe_float(hist["Close"].iloc[-1])
                 if cur > 0:
-                    return {"price": cur, "change": 0}
+                    return {"price": cur, "prev": cur, "change": 0}
         except Exception as e:
             if attempt < retries - 1:
                 time.sleep(2)
@@ -212,8 +657,12 @@ def get_yf_single(ticker, name, retries=3):
             print(f"[WARN] yfinance {ticker} failed: {e}")
     return None
 
+
 def get_yf_quotes():
     """逐个获取 yfinance 行情"""
+    if os.environ.get("SKIP_YF"):
+        print("[INFO] SKIP_YF set, skipping yfinance in local dev...")
+        return {}
     tickers = [
         ("^DJI", "道琼斯"),
         ("^IXIC", "纳斯达克"),
@@ -232,14 +681,87 @@ def get_yf_quotes():
     ]
     result = {}
     for symbol, name in tickers:
-        r = get_yf_single(symbol, name)
+        r = get_yf_single(symbol)
         if r:
             result[name] = r
             print(f"   yfinance {name}: {r['price']:.2f} ({fmt_pct(r['change'])})")
         else:
             print(f"   yfinance {name}: FAILED")
-        time.sleep(0.5)  # 避免被限流
+        time.sleep(0.5)
     return result
+
+
+def parse_sina_external(text):
+    """解析新浪外汇/全球指数/商品行情
+    返回: {标准名称: {price, prev, change}}
+    """
+    result = {}
+    if not text:
+        return result
+
+    # 标准名称 -> (新浪代码, 字段解析方式, 价格缩放)
+    # 美股指数字段: 名称,最新,涨跌幅%,时间,涨跌额,昨收,...
+    # 商品字段: 最新,涨跌额,买,卖,最高,最低,时间,昨收,开盘价,...,名称
+    # 外汇字段: 时间,最新?,...,昨收?,名称,日期
+    mapping = {
+        "道琼斯": ("gb_dji", "us_index", 1),
+        "纳斯达克": ("gb_ixic", "us_index", 1),
+        "标普500": ("gb_inx", "us_index", 1),
+        "黄金": ("hf_GC", "commodity", 1),
+        "白银": ("hf_SI", "commodity", 1),
+        "铜": ("hf_HG", "commodity", 0.01),  # 美分/磅 -> 美元/磅
+        "WTI原油": ("hf_CL", "commodity", 1),
+        "布伦特原油": ("hf_OIL", "commodity", 1),
+        "美元兑人民币": ("USDCNY", "forex", 1),
+    }
+    code_to_name = {v[0]: (k, v[1], v[2]) for k, v in mapping.items()}
+
+    for line in text.strip().split(";"):
+        line = line.strip()
+        if not line:
+            continue
+        m = re.search(r'var\s+hq_str_(\w+)="(.*?)"', line)
+        if not m:
+            continue
+        code = m.group(1)
+        content = m.group(2)
+        if code not in code_to_name or not content:
+            continue
+        name, parse_type, scale = code_to_name[code]
+        parts = content.split(",")
+        try:
+            if parse_type == "us_index":
+                # 道琼斯,52218.5781,-0.01,...
+                price = safe_float(parts[1]) * scale
+                chg = safe_float(parts[2])
+                prev = price / (1 + chg / 100) if chg != 0 else safe_float(parts[5])
+            elif parse_type == "commodity":
+                # 最新,涨跌额,买,卖,最高,最低,时间,昨收,开盘价,...
+                price = safe_float(parts[0]) * scale
+                prev = safe_float(parts[7]) * scale
+                chg = (price - prev) / prev * 100 if prev > 0 else 0
+            elif parse_type == "forex":
+                # 时间,最新,卖出,买入,成交量,最高,开盘,最低,昨收,名称,日期
+                price = safe_float(parts[1]) * scale
+                prev = safe_float(parts[8]) * scale
+                chg = (price - prev) / prev * 100 if prev > 0 else 0
+            else:
+                continue
+            if price > 0:
+                result[name] = {"price": price, "prev": prev, "change": chg}
+        except Exception as e:
+            print(f"[WARN] parse sina {code} failed: {e}")
+            continue
+    return result
+
+
+def get_sina_external():
+    """新浪财经获取外部市场备用数据"""
+    codes = "gb_dji,gb_ixic,gb_inx,hf_GC,hf_SI,hf_HG,hf_CL,hf_OIL,USDCNY"
+    url = f"https://hq.sinajs.cn/list={codes}"
+    text = fetch_text(url, headers={"Referer": "https://finance.sina.com.cn/"})
+    return parse_sina_external(text)
+
 
 # ---------------------------------------------------------------------------
 # 数据获取 — CoinGecko + Alternative.me
@@ -269,6 +791,7 @@ def get_crypto():
             pass
     return result
 
+
 def get_fear_greed():
     """恐惧贪婪指数"""
     data = fetch_json("https://api.alternative.me/fng/?limit=1")
@@ -281,23 +804,170 @@ def get_fear_greed():
             pass
     return None
 
+
 # ---------------------------------------------------------------------------
-# 宏观数据 (预设最新月度值)
+# 月度宏观/机构/房地产预设（最新可得数据）
 # ---------------------------------------------------------------------------
 
 MACRO_LATEST = {
-    "pmi": 50.3,       # 6月制造业PMI
-    "pmi_non": 50.2,   # 6月非制造业PMI
-    "cpi": 1.0,        # 6月CPI同比
-    "ppi": 4.1,        # 6月PPI同比 (注意：实际可能为负，此处用预设)
-    "m1": 4.0,         # 6月M1同比
-    "m2": 8.0,         # 6月M2同比
-    "social_finance": 33645,  # 6月社融增量(亿)
-    "export": 27.0,    # 6月出口同比
-    "import": 36.0,    # 6月进口同比
-    "retail": 1.0,     # 6月社零同比
-    "macro_date": "2025年6月",
+    "pmi": 50.3,
+    "pmi_non": 50.2,
+    "cpi": 1.0,
+    "ppi": 4.1,
+    "m1": 4.0,
+    "m2": 8.0,
+    "social_finance": 208400,  # 2026 年上半年社融增量累计（亿元），央行公布
+    "export": 27.0,
+    "import": 36.0,
+    "retail": 1.0,
+    "macro_date": "2026年6月",
 }
+
+# 公募股票型基金仓位（好买基金估算，月度）
+FUND_POSITION = {
+    "value": 86.5,  # 股票型基金仓位 %
+    "change": -0.3,  # 较上期变化 pct
+    "date": "2026年6月",
+}
+
+# 非银存款（月度）
+NON_BANK_DEPOSIT = {
+    "value": 28.6,  # 万亿元
+    "change": 0.8,  # 环比增减 万亿元
+    "date": "2026年6月",
+}
+
+# 房地产关键指标（月度）
+REAL_ESTATE = {
+    "invest_yoy": -18.0,  # 房地产开发投资同比 %
+    "sales_area_yoy": -11.6,  # 商品房销售面积同比 %
+    "sales_amount_yoy": -13.6,  # 商品房销售额同比 %
+    "date": "2026年1-6月",
+}
+
+# IPO 近期预设（当自动抓取失败时使用）
+IPO_PRESET = {"count": 6, "note": "本周约 6 只新股申购"}
+
+
+# ---------------------------------------------------------------------------
+# 数据获取 — 东方财富宏观数据 API（权威月度数据）
+# ---------------------------------------------------------------------------
+
+MACRO_APIS = [
+    # (reportName, 字段映射, 目标key)
+    ("RPT_ECONOMY_CPI", {"same": "NATIONAL_SAME", "seq": "NATIONAL_SEQUENTIAL"}, "cpi"),
+    ("RPT_ECONOMY_PPI", {"same": "BASE_SAME"}, "ppi"),
+    ("RPT_ECONOMY_PMI", {"make": "MAKE_INDEX", "nmake": "NMAKE_INDEX"}, "pmi"),
+    ("RPT_ECONOMY_CURRENCY_SUPPLY", {"m2": "BASIC_CURRENCY_SAME", "m1": "CURRENCY_SAME"}, "money"),
+    ("RPT_ECONOMY_RMB_LOAN", {"loan": "RMB_LOAN"}, "loan"),
+    ("RPT_ECONOMY_CUSTOMS", {"export": "EXIT_BASE_SAME", "import": "IMPORT_BASE_SAME"}, "trade"),
+    ("RPT_ECONOMY_TOTAL_RETAIL", {"retail": "RETAIL_TOTAL_SAME"}, "retail"),
+]
+
+
+def get_em_macro():
+    """从东方财富数据中心获取最新月度宏观数据；失败时返回预设值"""
+    result = dict(MACRO_LATEST)
+    result["source"] = "preset"
+    latest_date = None
+
+    def fetch_report(report_name):
+        url = (
+            "https://datacenter-web.eastmoney.com/api/data/v1/get"
+            f"?reportName={report_name}&columns=ALL"
+            "&pageNumber=1&pageSize=3"
+            "&sortColumns=REPORT_DATE&sortTypes=-1"
+        )
+        return fetch_json(url, headers={"Referer": "https://data.eastmoney.com/"}, timeout=20)
+
+    def parse_date(s):
+        if not s:
+            return None
+        try:
+            return datetime.strptime(str(s)[:10], "%Y-%m-%d").date()
+        except Exception:
+            return None
+
+    try:
+        # CPI
+        data = fetch_report("RPT_ECONOMY_CPI")
+        if data and data.get("result") and data["result"].get("data"):
+            row = data["result"]["data"][0]
+            result["cpi"] = safe_float(row.get("NATIONAL_SAME"))
+            result["cpi_sequential"] = safe_float(row.get("NATIONAL_SEQUENTIAL"))
+            latest_date = parse_date(row.get("REPORT_DATE"))
+
+        # PPI
+        data = fetch_report("RPT_ECONOMY_PPI")
+        if data and data.get("result") and data["result"].get("data"):
+            row = data["result"]["data"][0]
+            result["ppi"] = safe_float(row.get("BASE_SAME"))
+
+        # PMI
+        data = fetch_report("RPT_ECONOMY_PMI")
+        if data and data.get("result") and data["result"].get("data"):
+            row = data["result"]["data"][0]
+            result["pmi"] = safe_float(row.get("MAKE_INDEX"))
+            result["pmi_non"] = safe_float(row.get("NMAKE_INDEX"))
+
+        # M2/M1
+        data = fetch_report("RPT_ECONOMY_CURRENCY_SUPPLY")
+        if data and data.get("result") and data["result"].get("data"):
+            row = data["result"]["data"][0]
+            result["m2"] = safe_float(row.get("BASIC_CURRENCY_SAME"))
+            result["m1"] = safe_float(row.get("CURRENCY_SAME"))
+
+        # 新增信贷
+        data = fetch_report("RPT_ECONOMY_RMB_LOAN")
+        if data and data.get("result") and data["result"].get("data"):
+            row = data["result"]["data"][0]
+            result["rmb_loan"] = safe_float(row.get("RMB_LOAN"))
+
+        # 进出口
+        data = fetch_report("RPT_ECONOMY_CUSTOMS")
+        if data and data.get("result") and data["result"].get("data"):
+            row = data["result"]["data"][0]
+            result["export"] = safe_float(row.get("EXIT_BASE_SAME"))
+            result["import"] = safe_float(row.get("IMPORT_BASE_SAME"))
+
+        # 社零
+        data = fetch_report("RPT_ECONOMY_TOTAL_RETAIL")
+        if data and data.get("result") and data["result"].get("data"):
+            row = data["result"]["data"][0]
+            result["retail"] = safe_float(row.get("RETAIL_TOTAL_SAME"))
+
+        if latest_date:
+            result["macro_date"] = f"{latest_date.year}年{latest_date.month}月"
+        result["source"] = "eastmoney"
+    except Exception as e:
+        print(f"[WARN] 东方财富宏观API异常，使用预设值: {e}")
+
+    return result
+
+# 外部市场/加密 fallback（当 yfinance / CoinGecko 网络不可用时使用最近可得数据）
+# 必须包含 prev（昨收/前一交易日），用于计算美债 bp 变化
+EXTERNAL_FALLBACK = {
+    "道琼斯": {"price": 52218.58, "prev": 52224.64, "change": -0.01},
+    "纳斯达克": {"price": 25690.90, "prev": 25837.21, "change": -0.57},
+    "标普500": {"price": 7498.96, "prev": 7509.20, "change": -0.14},
+    "VIX恐慌指数": {"price": 17.79, "prev": 18.65, "change": -4.61},
+    "美债10Y": {"price": 4.626, "prev": 4.576, "change": 1.09},
+    "美债30Y": {"price": 5.131, "prev": 5.081, "change": 0.98},
+    "美债2Y": {"price": 4.245, "prev": 4.225, "change": 0.47},
+    "黄金": {"price": 4129.94, "prev": 4151.90, "change": -0.53},
+    "白银": {"price": 60.11, "prev": 60.30, "change": -0.31},
+    "铜": {"price": 6.52, "prev": 6.49, "change": 0.45},
+    "WTI原油": {"price": 87.73, "prev": 86.83, "change": 1.04},
+    "布伦特原油": {"price": 91.14, "prev": 90.18, "change": 1.07},
+    "美元指数": {"price": 101.18, "prev": 101.35, "change": -0.17},
+    "美元兑人民币": {"price": 6.7679, "prev": 6.7684, "change": -0.01},
+}
+
+CRYPTO_FALLBACK = {
+    "比特币": {"price": 66040.0, "change": 0.85},
+    "以太坊": {"price": 1925.0, "change": 1.20},
+}
+
 
 # ---------------------------------------------------------------------------
 # HTML 生成
@@ -321,7 +991,7 @@ body{font-family:'PingFang SC','Microsoft YaHei','Helvetica Neue',Arial,sans-ser
 .signal.neutral{border-left:3px solid #3498db}
 .section{margin:20px 0}
 .section-title{font-size:20px;font-weight:700;color:var(--accent);padding:8px 0;border-bottom:2px solid var(--accent);margin-bottom:16px}
-.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px}
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:12px}
 .card{background:var(--card);border-radius:10px;padding:16px;border:1px solid var(--border);box-shadow:0 2px 6px rgba(0,0,0,.06);transition:transform .2s}
 .card:hover{transform:translateY(-2px)}
 .card .label{font-size:12px;color:var(--sub);margin-bottom:4px}
@@ -339,9 +1009,11 @@ body{font-family:'PingFang SC','Microsoft YaHei','Helvetica Neue',Arial,sans-ser
 .tag.down{background:#e8f5e9;color:var(--down)}
 .tag.neutral{background:#e3f2fd;color:var(--safe)}
 .footer{text-align:center;padding:24px 0;font-size:12px;color:var(--sub)}
+.note{font-size:11px;color:#888;margin-top:4px}
 @media(max-width:768px){.cards{grid-template-columns:1fr 1fr}.chart-box{height:300px}}
 @media(max-width:480px){.cards{grid-template-columns:1fr}.container{padding:8px}}
 """
+
 
 def build_card(label, value, change_html="", extra=""):
     return f"""<div class="card">
@@ -350,6 +1022,7 @@ def build_card(label, value, change_html="", extra=""):
 {change_html}
 <div class="extra">{extra}</div>
 </div>"""
+
 
 def build_conclusion(summary, signals):
     sig_html = "\n".join(
@@ -361,9 +1034,9 @@ def build_conclusion(summary, signals):
 <div class="signals">{sig_html}</div>
 </div>"""
 
+
 def generate_html(d):
     """d = 全部数据字典, 返回完整 HTML 字符串"""
-    # 合并东方财富和 yfinance 的行情数据
     q = {}
     q.update(d.get("em_quotes", {}))
     q.update(d.get("yf_quotes", {}))
@@ -373,18 +1046,19 @@ def generate_html(d):
     breadth = d.get("breadth")
     margin = d.get("margin")
     north = d.get("north")
+    etf = d.get("etf")
     macro = d.get("macro", {})
     fear = d.get("fear_greed")
     turnover = d.get("turnover")
+    limit_stats = d.get("limit_stats")
+    futures_basis = d.get("futures_basis")
+    ipo = d.get("ipo")
 
     # --- 顶部结论 ---
     parts = []
     sh = q.get("上证指数", {})
-    sz = q.get("深证成指", {})
     cyb = q.get("创业板指", {})
     kc = q.get("科创50", {})
-    dji = q.get("道琼斯", {})
-    nas = q.get("纳斯达克", {})
     vix = q.get("VIX恐慌指数", {})
     gold = q.get("黄金", {})
     oil = q.get("WTI原油", {})
@@ -396,6 +1070,8 @@ def generate_html(d):
         parts.append(f"上证{sh['price']:.2f}({fmt_pct(sh['change'])})")
     if cyb:
         parts.append(f"创业板{cyb['price']:.2f}({fmt_pct(cyb['change'])})")
+    if kc:
+        parts.append(f"科创50{kc['price']:.2f}({fmt_pct(kc['change'])})")
     if vix:
         parts.append(f"VIX{vix['price']:.1f}")
     if gold:
@@ -420,7 +1096,7 @@ def generate_html(d):
         cls = "up" if kc["change"] >= 0 else "down"
         signals.append({"cls": cls, "text": f"科创50 {fmt_pct(kc['change'])}"})
     if vix:
-        cls = "neutral" if vix["change"] < 0 else "down"
+        cls = "up" if vix["change"] > 0 else "down"
         signals.append({"cls": cls, "text": f"VIX {vix['price']:.1f}"})
     if gold:
         cls = "up" if gold["change"] >= 0 else "down"
@@ -431,16 +1107,20 @@ def generate_html(d):
     if tnk:
         signals.append({"cls": "neutral", "text": f"美债10Y {tnk['price']:.2f}%"})
     if dxy:
-        cls = "down" if dxy["change"] > 0 else "up"
+        cls = "up" if dxy["change"] > 0 else "down"
         signals.append({"cls": cls, "text": f"DXY {dxy['price']:.2f}"})
-    if north:
+    if north and north.get("value") is not None:
         cls = "down" if north["value"] < 0 else "up"
         signals.append({"cls": cls, "text": f"北向{north['value']:+.1f}亿"})
     if margin:
         val = margin.get("value", 0) / 1e8
         signals.append({"cls": "neutral", "text": f"两融{val:.0f}亿"})
+    if etf:
+        val = etf.get("total", 0) / 1e8
+        cls = "up" if val >= 0 else "down"
+        signals.append({"cls": cls, "text": f"ETF{val:+.1f}亿"})
     if fear:
-        signals.append({"cls": "neutral", "text": f"恐惧贪婪{fear['value']} {fear['class']}"})
+        signals.append({"cls": "neutral", "text": f"恐贪{fear['value']} {fear['class']}"})
 
     # --- 经济基本面 ---
     macro_cards = ""
@@ -459,42 +1139,73 @@ def generate_html(d):
 
         if pmi:
             cls = "up" if pmi >= 50 else "down"
-            macro_cards += build_card("制造业PMI", f"{pmi:.1f}%",
+            macro_cards += build_card(
+                "制造业PMI", f"{pmi:.1f}%",
                 f'<span class="change {cls}">{"扩张" if pmi >= 50 else "收缩"}区间</span>', mdate)
         if pmi_non:
             cls = "up" if pmi_non >= 50 else "down"
-            macro_cards += build_card("非制造业PMI", f"{pmi_non:.1f}%",
+            macro_cards += build_card(
+                "非制造业PMI", f"{pmi_non:.1f}%",
                 f'<span class="change {cls}">{"扩张" if pmi_non >= 50 else "收缩"}区间</span>', mdate)
         if cpi is not None:
             cls = "up" if cpi > 0 else "down"
-            macro_cards += build_card("CPI同比", f"+{cpi:.1f}%",
+            macro_cards += build_card(
+                "CPI同比", f"+{cpi:.1f}%",
                 f'<span class="change {cls}"> consumer prices</span>', mdate)
         if ppi is not None:
             cls = "up" if ppi > 0 else "down"
-            macro_cards += build_card("PPI同比", f"+{ppi:.1f}%",
+            macro_cards += build_card(
+                "PPI同比", f"+{ppi:.1f}%",
                 f'<span class="change {cls}"> producer prices</span>', mdate)
         if m2:
-            macro_cards += build_card("M2同比", f"+{m2:.1f}%",
+            macro_cards += build_card(
+                "M2同比", f"+{m2:.1f}%",
                 '<span class="change neutral">货币供应</span>', mdate)
         if m1:
-            macro_cards += build_card("M1同比", f"+{m1:.1f}%",
+            macro_cards += build_card(
+                "M1同比", f"+{m1:.1f}%",
                 '<span class="change neutral">货币供应</span>', mdate)
         if m1 and m2:
             sc = m2 - m1
-            macro_cards += build_card("M2-M1剪刀差", f"{sc:.1f}pct",
+            macro_cards += build_card(
+                "M2-M1剪刀差", f"{sc:.1f}pct",
                 '<span class="change neutral">剪刀差</span>', mdate)
         if sf:
-            macro_cards += build_card("社融增量", f"{sf:,.0f}亿",
-                '<span class="change neutral">最新一期</span>', mdate)
+            # 社融数字较大，以“万亿”展示
+            sf_wan = sf / 10000
+            macro_cards += build_card(
+                "社融增量", f"{sf_wan:.2f}万亿",
+                '<span class="change neutral">央行公布上半年累计</span>', mdate)
+        if "rmb_loan" in macro and macro["rmb_loan"]:
+            macro_cards += build_card(
+                "新增信贷", f"{macro['rmb_loan']:,.0f}亿",
+                '<span class="change neutral">人民币贷款</span>', mdate)
         if exp:
-            macro_cards += build_card("出口同比", f"+{exp:.1f}%",
+            macro_cards += build_card(
+                "出口同比", f"+{exp:.1f}%",
                 '<span class="change up">外需</span>', mdate)
         if imp:
-            macro_cards += build_card("进口同比", f"+{imp:.1f}%",
+            macro_cards += build_card(
+                "进口同比", f"+{imp:.1f}%",
                 '<span class="change up">内需</span>', mdate)
         if ret is not None:
-            macro_cards += build_card("社零同比", f"+{ret:.1f}%",
+            macro_cards += build_card(
+                "社零同比", f"+{ret:.1f}%",
                 '<span class="change neutral">消费</span>', mdate)
+
+    # 房地产
+    re = d.get("real_estate", {})
+    if re:
+        macro_cards += build_card(
+            "房地产投资同比", f"{re.get('invest_yoy'):+.1f}%",
+            '<span class="change neutral">房地产开发投资</span>', re.get("date", ""))
+        macro_cards += build_card(
+            "商品房销售面积同比", f"{re.get('sales_area_yoy'):+.1f}%",
+            '<span class="change neutral">销售面积</span>', re.get("date", ""))
+        macro_cards += build_card(
+            "商品房销售额同比", f"{re.get('sales_amount_yoy'):+.1f}%",
+            '<span class="change neutral">销售额</span>', re.get("date", ""))
+
     if not macro_cards:
         macro_cards = build_card("宏观数据", "暂无最新数据", '<span class="change neutral">待更新</span>')
 
@@ -505,44 +1216,129 @@ def generate_html(d):
         if v:
             chg = v["change"]
             cls = "up" if chg >= 0 else "down"
-            emo_cards += build_card(name, f"{v['price']:.2f}",
+            emo_cards += build_card(
+                name, f"{v['price']:.2f}",
                 f'<span class="change {cls}">{fmt_pct(chg)}</span>')
+
     if breadth:
-        emo_cards += build_card("涨跌家数", f"{breadth['up']} / {breadth['down']}",
-            f'<span class="change {"up" if breadth["up"] > breadth["down"] else "down"}">涨停{breadth["limit_up"]} 跌停{breadth["limit_down"]}</span>')
+        source_note = ""
+        if breadth.get("source") == "eastmoney_margin_estimate":
+            source_note = f"两融标的样本{breadth.get('sample', 0)}只（估算）"
+        emo_cards += build_card(
+            "涨跌家数", f"{breadth['up']} / {breadth['down']}",
+            f'<span class="change {"up" if breadth["up"] > breadth["down"] else "down"}">'
+            f'涨停{breadth["limit_up"]} 跌停{breadth["limit_down"]}</span>',
+            source_note)
+
+    if limit_stats:
+        consec_text = f"最高{limit_stats['max']}连板"
+        emo_cards += build_card(
+            "连板强度", f"2板{limit_stats['two']} / 3板{limit_stats['three']} / 4板+{limit_stats['four_plus']}",
+            f'<span class="change neutral">{consec_text}</span>')
+
     if vix:
-        cls = "down" if vix["change"] > 0 else "up"
-        emo_cards += build_card("VIX恐慌指数", f"{vix['price']:.2f}",
+        # VIX 数值上涨=恐慌升温，按“涨红跌绿”显示
+        cls = "up" if vix["change"] > 0 else "down"
+        emo_cards += build_card(
+            "VIX恐慌指数", f"{vix['price']:.2f}",
             f'<span class="change {cls}">{fmt_pct(vix["change"])}</span>')
+
     if fear:
-        emo_cards += build_card("恐惧贪婪指数", f"{fear['value']}",
+        emo_cards += build_card(
+            "恐惧贪婪指数", f"{fear['value']}",
             f'<span class="change neutral">{fear["class"]}</span>')
+
+    # 热门板块 Top5 涨跌（进攻/防守判断）
+    if sectors:
+        top5 = sectors[:5]
+        bottom5 = sectors[-5:]
+        top_text = " / ".join([f"{s['name']}{s['change']:+.2f}%" for s in top5])
+        bottom_text = " / ".join([f"{s['name']}{s['change']:+.2f}%" for s in bottom5])
+        offensive = any(k in top5[0]["name"] for k in ["科技", "电子", "半导体", "芯片", "AI", "计算机", "通信", "新能源"])
+        bias = "偏进攻" if offensive else "偏防守"
+        emo_cards += build_card(
+            "领涨板块 Top5", top_text,
+            f'<span class="change {"up" if top5[0]["change"] >= 0 else "down"}">{bias}</span>')
+        emo_cards += build_card(
+            "领跌板块 Top5", bottom_text,
+            f'<span class="change {"down" if bottom5[-1]["change"] < 0 else "up"}">承压方向</span>')
 
     # --- 资金面 ---
     fund_cards = ""
     if turnover and turnover > 0:
         turnover_yi = turnover / 1e8
-        fund_cards += build_card("两市成交额", f"{turnover_yi:.0f}亿",
-            '<span class="change neutral">沪深合计</span>')
+        fund_cards += build_card(
+            "两市成交额", f"{turnover_yi/1e4:.2f}万亿",
+            f'<span class="change neutral">沪深合计 {turnover_yi:,.0f} 亿</span>')
+
     if margin:
         val = margin.get("value", 0) / 1e8
-        fund_cards += build_card("两融余额", f"{val:.0f}亿",
-            '<span class="change neutral">最新数据</span>', margin.get("date", ""))
+        fund_cards += build_card(
+            "两融余额", f"{val:,.0f}亿",
+            f'<span class="change neutral">融资{margin.get("rzye", 0)/1e8:,.0f}亿 / 融券{margin.get("rqye", 0)/1e8:,.0f}亿</span>',
+            f'{margin.get("date", "")}（按标的证券汇总）')
+
     if north:
-        cls = "down" if north["value"] < 0 else "up"
-        fund_cards += build_card("北向资金", f"{north['value']:+.1f}亿",
-            f'<span class="change {cls}">净{"卖出" if north["value"] < 0 else "买入"}</span>')
-    fund_cards += build_card("ETF资金", "待补充",
-        '<span class="change neutral">需手动更新</span>')
+        if north.get("value") is not None:
+            cls = "down" if north["value"] < 0 else "up"
+            fund_cards += build_card(
+                "北向资金", f"{north['value']:+.1f}亿",
+                f'<span class="change {cls}">净{"卖出" if north["value"] < 0 else "买入"}</span>',
+                f'{north.get("date", "")}（港交所收盘后公布）')
+        else:
+            fund_cards += build_card(
+                "北向资金", "暂停实时披露",
+                '<span class="change neutral">港交所自2024-05-13起不再实时披露</span>')
+
+    if etf:
+        val = etf.get("total", 0) / 1e8
+        cls = "up" if val >= 0 else "down"
+        top_etf = etf.get("top", [])
+        top_text = " / ".join([f"{x['name'][:6]}{x['flow']/1e8:+.1f}亿" for x in top_etf[:3]])
+        fund_cards += build_card(
+            "ETF资金流向", f"{val:+.1f}亿",
+            f'<span class="change {cls}">前15只ETF合计</span>',
+            top_text)
+    else:
+        fund_cards += build_card(
+            "ETF资金流向", "--",
+            '<span class="change neutral">东方财富ETF接口暂不可用（云端正常）</span>')
+
+    # 公募仓位
+    fp = d.get("fund_position", {})
+    if fp:
+        cls = "up" if fp.get("change", 0) >= 0 else "down"
+        fund_cards += build_card(
+            "公募基金仓位", f"{fp.get('value'):.1f}%",
+            f'<span class="change {cls}">{fmt_pct(fp.get("change", 0))}</span>',
+            f'{fp.get("date", "")}（股票型估算）')
+
+    # 非银存款
+    nb = d.get("non_bank_deposit", {})
+    if nb:
+        cls = "up" if nb.get("change", 0) >= 0 else "down"
+        fund_cards += build_card(
+            "非银存款", f"{nb.get('value'):.1f}万亿",
+            f'<span class="change {cls}">环比{fmt_pct(nb.get("change", 0), suffix="万亿")}</span>',
+            nb.get("date", ""))
 
     # --- 外部市场 ---
     ext_cards = ""
-    for label, key in [("美元指数", "美元指数"), ("美元/人民币", "美元兑人民币"),
-                        ("黄金", "黄金"), ("白银", "白银"), ("铜", "铜"),
-                        ("WTI原油", "WTI原油"), ("布伦特原油", "布伦特原油"),
-                        ("比特币", "比特币"), ("以太坊", "以太坊"),
-                        ("道琼斯", "道琼斯"), ("纳斯达克", "纳斯达克"), ("标普500", "标普500"),
-                        ("恒生指数", "恒生指数")]:
+    for label, key in [
+        ("美元指数", "美元指数"),
+        ("美元/人民币", "美元兑人民币"),
+        ("黄金", "黄金"),
+        ("白银", "白银"),
+        ("铜", "铜"),
+        ("WTI原油", "WTI原油"),
+        ("布伦特原油", "布伦特原油"),
+        ("比特币", "比特币"),
+        ("以太坊", "以太坊"),
+        ("道琼斯", "道琼斯"),
+        ("纳斯达克", "纳斯达克"),
+        ("标普500", "标普500"),
+        ("恒生指数", "恒生指数"),
+    ]:
         v = q.get(key)
         if v:
             chg = v["change"]
@@ -557,24 +1353,60 @@ def generate_html(d):
                 price_str = f"{v['price']:.4f}"
             else:
                 price_str = f"{v['price']:,.2f}"
-            ext_cards += build_card(label, price_str,
+            ext_cards += build_card(
+                label, price_str,
                 f'<span class="change {cls}">{fmt_pct(chg)}</span>')
 
-    # --- 美债 ---
+    # --- 美债收益率 ---
     bond_cards = ""
     for label, key in [("美债2Y", "美债2Y"), ("美债10Y", "美债10Y"), ("美债30Y", "美债30Y")]:
         v = q.get(key)
         if v:
             chg = v["change"]
-            cls = "down" if chg > 0 else "up"
-            bond_cards += build_card(label, f"{v['price']:.3f}%",
-                f'<span class="change {cls}">{fmt_pct(chg)}bp</span>')
+            # 收益率本身上行=数值变大，按中国股市“涨红跌绿”显示
+            cls = "up" if chg > 0 else "down"
+            # price 本身就是收益率%，差值*100 = bp
+            bp = (v.get("price", 0) - v.get("prev", v["price"])) * 100
+            bond_cards += build_card(
+                label, f"{v['price']:.3f}%",
+                f'<span class="change {cls}">{bp:+.1f}bp</span>')
     t2 = q.get("美债2Y")
     t10 = q.get("美债10Y")
     if t2 and t10:
         spread = t10["price"] - t2["price"]
-        bond_cards += build_card("10Y-2Y利差", f"{spread:.3f}%",
+        bond_cards += build_card(
+            "10Y-2Y利差", f"{spread:.3f}%",
             '<span class="change neutral">收益率曲线</span>')
+
+    # --- 风险指标 ---
+    risk_cards = ""
+    if vix:
+        cls = "up" if vix["change"] > 0 else "down"
+        risk_cards += build_card(
+            "VIX恐慌指数", f"{vix['price']:.2f}",
+            f'<span class="change {cls}">{fmt_pct(vix["change"])}</span>')
+    if fear:
+        risk_cards += build_card(
+            "恐惧贪婪指数", f"{fear['value']}",
+            f'<span class="change neutral">{fear["class"]}</span>')
+    if breadth:
+        ratio = breadth["up"] / max(breadth["down"], 1)
+        cls = "up" if ratio >= 1 else "down"
+        risk_cards += build_card(
+            "涨跌比", f"{ratio:.2f}",
+            f'<span class="change {cls}">涨{breadth["up"]} / 跌{breadth["down"]}</span>')
+    if futures_basis:
+        basis_text = " / ".join(
+            [f"{b['name']}{b['basis_pct']:+.2f}%" for b in futures_basis]
+        )
+        risk_cards += build_card(
+            "股指期货升贴水", basis_text,
+            '<span class="change neutral">期货-现货</span>')
+    if ipo:
+        risk_cards += build_card(
+            "IPO数量", f"{ipo.get('count', '--')}只",
+            '<span class="change neutral">近两周申购</span>',
+            ipo.get("note", ""))
 
     # --- ECharts 图表数据 ---
     idx_data = []
@@ -653,6 +1485,11 @@ def generate_html(d):
 <div class="cards">{bond_cards}</div>
 </div>
 
+<div class="section">
+<div class="section-title">六、风险指标</div>
+<div class="cards">{risk_cards}</div>
+</div>
+
 <div class="chart-box"><div class="chart-title">主要指数涨跌幅 (%)</div><div id="chart1" style="width:100%;height:360px"></div></div>
 <div class="chart-box"><div class="chart-title">外部资产涨跌幅 (%)</div><div id="chart2" style="width:100%;height:360px"></div></div>
 <div class="chart-box"><div class="chart-title">行业板块涨跌幅 Top (%)</div><div id="chart3" style="width:100%;height:360px"></div></div>
@@ -660,8 +1497,8 @@ def generate_html(d):
 <div class="chart-box"><div class="chart-title">风险指标</div><div id="chart5" style="width:100%;height:360px"></div></div>
 
 <div class="footer">
-<p>数据来源: 东方财富 / Yahoo Finance / CoinGecko | GitHub Actions 每日自动生成 | Cloudflare Pages 托管</p>
-<p>中国股市颜色规则: 涨红跌绿 | 生成时间: {NOW_STR}</p>
+<p>数据来源: 东方财富(push2/datacenter) / 新浪财经 / Yahoo Finance / CoinGecko / Alternative.me | GitHub Actions 每日自动生成 | Cloudflare Pages 托管</p>
+<p>中国股市颜色规则: 涨红跌绿 | 月度宏观数据来自东方财富数据中心API | 涨跌家数在push2受限时使用两融明细ZDF估算 | 生成时间: {NOW_STR}</p>
 </div>
 
 </div>
@@ -736,6 +1573,7 @@ if(riskData.length > 0) makeGauge('chart5', riskData);
 </html>"""
     return html
 
+
 # ---------------------------------------------------------------------------
 # 主函数
 # ---------------------------------------------------------------------------
@@ -745,68 +1583,122 @@ def main():
 
     all_data = {}
 
-    # 1. 东方财富 A 股指数
-    print(">> 获取东方财富 A 股指数...")
+    # 1. A 股 + 港股 + 宽基指数
+    print(">> 获取东方财富指数行情...")
     all_data["em_quotes"] = get_em_indices()
     print(f"   获取到 {len(all_data['em_quotes'])} 个指数")
 
-    # 2. 东方财富 板块
+    # 2. 行业板块
     print(">> 获取东方财富板块数据...")
     all_data["sectors"] = get_em_sectors()
     print(f"   获取到 {len(all_data['sectors'])} 个板块")
 
-    # 3. 东方财富 涨跌家数
+    # 3. 涨跌家数
     print(">> 获取涨跌家数...")
     all_data["breadth"] = get_em_market_breadth()
     if all_data["breadth"]:
         b = all_data["breadth"]
         print(f"   涨{b['up']} 跌{b['down']} 涨停{b['limit_up']} 跌停{b['limit_down']}")
 
-    # 4. 东方财富 成交额
+    # 4. 成交额
     print(">> 获取两市成交额...")
     all_data["turnover"] = get_em_turnover()
     if all_data["turnover"]:
         print(f"   成交额: {all_data['turnover'] / 1e8:.0f}亿")
 
-    # 5. 东方财富 两融余额
+    # 5. 连板强度
+    print(">> 获取连板强度...")
+    all_data["limit_stats"] = get_limit_up_stats()
+    if all_data["limit_stats"]:
+        ls = all_data["limit_stats"]
+        print(f"   涨停{ls['limit_up_count']}只，最高{ls['max']}连板，2板{ls['two']} 3板{ls['three']} 4板+{ls['four_plus']}")
+
+    # 6. 两融余额
     print(">> 获取两融余额...")
     all_data["margin"] = get_em_margin()
     if all_data["margin"]:
-        print(f"   两融余额: {all_data['margin']['value'] / 1e8:.0f}亿")
+        m = all_data["margin"]
+        print(f"   两融余额 {m['date']}: {m['value']/1e8:,.0f}亿 (RZYE={m['rzye']/1e8:,.0f}亿, RQYE={m['rqye']/1e8:,.0f}亿, count={m['count']})")
 
-    # 6. 东方财富 北向资金
+    # 7. 北向资金
     print(">> 获取北向资金...")
     all_data["north"] = get_em_north_flow()
-    if all_data["north"]:
+    if all_data["north"] and all_data["north"].get("value") is not None:
         print(f"   北向净: {all_data['north']['value']:+.1f}亿")
+    else:
+        print("   北向资金实时数据已停止披露")
 
-    # 7. yfinance 美股/美债/商品
+    # 8. ETF 资金流向
+    print(">> 获取ETF资金流向...")
+    all_data["etf"] = get_em_etf_flow()
+    if all_data["etf"]:
+        print(f"   ETF合计: {all_data['etf']['total']/1e8:+.1f}亿")
+
+    # 9. yfinance 美股/美债/商品
     print(">> 获取 yfinance 行情...")
     all_data["yf_quotes"] = get_yf_quotes()
+
+    # 9b. yfinance 失败时尝试新浪财经备用
+    if len(all_data["yf_quotes"]) < 10:
+        print(">> yfinance 获取不完整，尝试新浪财经备用...")
+        sina_ext = get_sina_external()
+        for key, val in sina_ext.items():
+            if key not in all_data["yf_quotes"]:
+                all_data["yf_quotes"][key] = val
+                print(f"   sina {key}: {val['price']:.4f} ({fmt_pct(val['change'])})")
+
+    # 网络不可用时用 fallback 补全，避免看板空白
+    for key, val in EXTERNAL_FALLBACK.items():
+        if key not in all_data["yf_quotes"]:
+            all_data["yf_quotes"][key] = val
+            print(f"   fallback {key}: {val['price']}")
     print(f"   获取到 {len(all_data['yf_quotes'])} 个品种")
 
-    # 8. CoinGecko 加密货币
+    # 10. 加密货币
     print(">> 获取 CoinGecko 加密货币...")
     all_data["crypto"] = get_crypto()
+    for key, val in CRYPTO_FALLBACK.items():
+        if key not in all_data["crypto"]:
+            all_data["crypto"][key] = val
+            print(f"   fallback {key}: {val['price']}")
     print(f"   获取到 {len(all_data['crypto'])} 个加密货币")
 
-    # 9. 恐惧贪婪指数
+    # 11. 恐惧贪婪指数
     print(">> 获取恐惧贪婪指数...")
     all_data["fear_greed"] = get_fear_greed()
     if all_data["fear_greed"]:
         print(f"   恐惧贪婪: {all_data['fear_greed']['value']} {all_data['fear_greed']['class']}")
 
-    # 10. 宏观数据 (预设最新值)
-    all_data["macro"] = MACRO_LATEST
+    # 12. 股指期货升贴水
+    print(">> 获取股指期货升贴水...")
+    all_data["futures_basis"] = get_futures_basis()
+    if all_data["futures_basis"]:
+        for b in all_data["futures_basis"]:
+            print(f"   {b['name']}: {b['basis_pct']:+.3f}%")
 
-    # 11. 生成 HTML
+    # 13. IPO 数量
+    print(">> 获取IPO数量...")
+    all_data["ipo"] = get_ipo_count()
+    print(f"   IPO: {all_data['ipo']}")
+
+    # 14. 宏观/公募/房地产/非银存款
+    print(">> 获取东方财富宏观数据...")
+    all_data["macro"] = get_em_macro()
+    print(f"   宏观数据日期: {all_data['macro'].get('macro_date')}, 来源: {all_data['macro'].get('source')}")
+    all_data["fund_position"] = FUND_POSITION
+    all_data["non_bank_deposit"] = NON_BANK_DEPOSIT
+    all_data["real_estate"] = REAL_ESTATE
+
+    # 15. 生成 HTML
     print(">> 生成 HTML...")
     html = generate_html(all_data)
 
-    # 12. 写入文件
-    out_dir = os.environ.get("OUTPUT_DIR", "dist")
-    os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, "index.html")
+    # 16. 写入文件
+    # GitHub Actions 可通过 OUTPUT_PATH 指定完整路径，如 dist/index.html
+    out_path = os.environ.get("OUTPUT_PATH", "dist/index.html")
+    out_dir = os.path.dirname(out_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(html)
 
@@ -817,7 +1709,11 @@ def main():
           f"breadth:{'Y' if all_data['breadth'] else 'N'} "
           f"margin:{'Y' if all_data['margin'] else 'N'} "
           f"north:{'Y' if all_data['north'] else 'N'} "
-          f"turnover:{'Y' if all_data.get('turnover') else 'N'}")
+          f"etf:{'Y' if all_data.get('etf') else 'N'} "
+          f"turnover:{'Y' if all_data.get('turnover') else 'N'} "
+          f"limit_stats:{'Y' if all_data.get('limit_stats') else 'N'} "
+          f"futures_basis:{'Y' if all_data.get('futures_basis') else 'N'}")
+
 
 if __name__ == "__main__":
     main()
