@@ -2,8 +2,8 @@ name: Daily Finance Dashboard
 
 on:
   schedule:
-    # UTC 01:00 = 北京时间 09:00
-    - cron: '0 1 * * *'
+    # UTC 00:00 = 北京时间 08:00
+    - cron: '0 0 * * *'
   workflow_dispatch: # 支持手动触发
 
 jobs:
@@ -39,8 +39,3 @@ jobs:
           projectName: finance-dashboard
           directory: dist
           gitHubToken: ${{ secrets.GITHUB_TOKEN }}
-
-permissions:
-  contents: read
-  deployments: write
-
