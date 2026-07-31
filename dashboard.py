@@ -104,16 +104,24 @@ EM_HEADERS = {
     "Referer": "https://quote.eastmoney.com/",
 }
 
-# A 股主要指数（含股指期货对应现货）
-EM_INDEX_SECIDS = "1.000001,0.399001,0.399006,1.000688,100.HSI,1.000300,1.000905,1.000016,1.000852"
+# A 股主要指数（含股指期货对应现货，以及沪深两市A股指数用于涨跌家数）
+EM_INDEX_SECIDS = "1.000001,0.399001,0.399006,1.000688,100.HSI,1.000300,1.000905,1.000016,1.000852,1.000002,0.399107"
+
+# 缓存：在 get_em_indices 中顺带获取的沪深两市全市场涨跌家数
+_FULL_BREADTH_CACHE = None
 
 
 def get_em_indices():
-    """东方财富获取 A 股 + 港股 + 宽基指数实时行情；失败时自动 fallback 新浪财经"""
-    fields = "f2,f3,f4,f6,f12,f14"
+    """东方财富获取 A 股 + 港股 + 宽基指数实时行情；失败时自动 fallback 新浪财经。
+    顺带从上证A指(000002)和深证A指(399107)提取沪深两市全市场涨跌平家数，缓存备用。
+    """
+    global _FULL_BREADTH_CACHE
+    fields = "f2,f3,f4,f6,f12,f14,f104,f105,f106"
     url = f"http://push2.eastmoney.com/api/qt/ulist.np/get?secids={EM_INDEX_SECIDS}&fields={fields}&fltt=2"
     data = fetch_json(url, headers=EM_HEADERS)
     result = {}
+    up_sum, down_sum, flat_sum = 0, 0, 0
+    breadth_names = {"Ａ股指数", "深证Ａ指"}
     if data and data.get("data") and data["data"].get("diff"):
         for item in data["data"]["diff"]:
             name = item.get("f14", "")
@@ -122,6 +130,19 @@ def get_em_indices():
             turnover = safe_float(item.get("f6"))
             if price > 0:
                 result[name] = {"price": price, "change": chg, "turnover": turnover}
+            # 缓存全市场涨跌平
+            if name in breadth_names:
+                up_sum += int(safe_float(item.get("f104", 0)))
+                down_sum += int(safe_float(item.get("f105", 0)))
+                flat_sum += int(safe_float(item.get("f106", 0)))
+        total = up_sum + down_sum + flat_sum
+        if total >= 3000:
+            _FULL_BREADTH_CACHE = {
+                "up": up_sum,
+                "down": down_sum,
+                "flat": flat_sum,
+                "source": "eastmoney_full_market",
+            }
     if len(result) >= 5:
         return result
 
@@ -300,46 +321,103 @@ def get_breadth_from_margin():
     }
 
 
-def get_em_market_breadth():
-    """东方财富分页获取全市场 A 股涨跌家数；失败时 fallback 两融明细 ZDF 估算"""
+def get_full_market_breadth_from_indices():
+    """通过上证A股指数(000002)和深证A指(399107)的 f104/f105/f106 字段，
+    获取沪深两市所有上市公司涨跌平家数。f104=上涨，f105=下跌，f106=平盘。
+    优先使用 get_em_indices 中已缓存的数据，避免重复请求被限流。
+    """
+    global _FULL_BREADTH_CACHE
+    if _FULL_BREADTH_CACHE is not None:
+        return _FULL_BREADTH_CACHE
+
+    url = (
+        "http://push2.eastmoney.com/api/qt/ulist.np/get"
+        "?secids=1.000002,0.399107&fields=f104,f105,f106,f3,f14&fltt=2"
+    )
+    data = fetch_json(url, headers=EM_HEADERS, timeout=20)
+    if not data or not data.get("data") or not data["data"].get("diff"):
+        return None
+    items = data["data"]["diff"]
+    if len(items) < 2:
+        return None
+    up = sum(int(safe_float(item.get("f104", 0))) for item in items)
+    down = sum(int(safe_float(item.get("f105", 0))) for item in items)
+    flat = sum(int(safe_float(item.get("f106", 0))) for item in items)
+    total = up + down + flat
+    if total < 3000:
+        return None
+    _FULL_BREADTH_CACHE = {
+        "up": up,
+        "down": down,
+        "flat": flat,
+        "source": "eastmoney_full_market",
+    }
+    return _FULL_BREADTH_CACHE
+
+
+def get_em_limit_counts():
+    """获取沪深两市涨停/跌停家数（push2 clist），失败返回 None"""
     fs = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
-    fields = "f3"
-    page_size = 100
-    all_changes = []
-    for page in range(1, 60):
-        url = (
-            f"http://push2.eastmoney.com/api/qt/clist/get"
-            f"?pn={page}&pz={page_size}&po=1&np=1&fltt=2&invt=2"
-            f"&fid=f3&fs={fs}&fields={fields}"
-        )
-        data = fetch_json(url, headers=EM_HEADERS, timeout=30)
-        if not data or not data.get("data") or not data["data"].get("diff"):
-            break
-        items = data["data"]["diff"]
-        if not items:
-            break
-        for item in items:
-            c = item.get("f3")
-            if c is not None:
-                all_changes.append(safe_float(c))
-        if len(items) < page_size:
-            break
+    # 涨停：按涨跌幅降序取前 500，统计 >=9.9% 的数量
+    up_url = (
+        "http://push2.eastmoney.com/api/qt/clist/get"
+        f"?pn=1&pz=500&po=1&np=1&fltt=2&invt=2&fid=f3&fs={fs}&fields=f3"
+    )
+    # 跌停：按涨跌幅升序取前 500，统计 <=-9.9% 的数量
+    down_url = (
+        "http://push2.eastmoney.com/api/qt/clist/get"
+        f"?pn=1&pz=500&po=0&np=1&fltt=2&invt=2&fid=f3&fs={fs}&fields=f3"
+    )
+    up_count = 0
+    down_count = 0
 
-    if len(all_changes) >= 3000:
-        up = sum(1 for c in all_changes if c > 0)
-        down = sum(1 for c in all_changes if c < 0)
-        flat = sum(1 for c in all_changes if c == 0)
-        limit_up = sum(1 for c in all_changes if c >= 9.9)
-        limit_down = sum(1 for c in all_changes if c <= -9.9)
-        return {
-            "up": up,
-            "down": down,
-            "flat": flat,
-            "limit_up": limit_up,
-            "limit_down": limit_down,
-            "source": "eastmoney",
-        }
+    up_data = fetch_json(up_url, headers=EM_HEADERS, timeout=20)
+    if up_data and up_data.get("data") and up_data["data"].get("diff"):
+        for item in up_data["data"]["diff"]:
+            c = safe_float(item.get("f3"))
+            if c >= 9.9:
+                up_count += 1
+            else:
+                break
 
+    down_data = fetch_json(down_url, headers=EM_HEADERS, timeout=20)
+    if down_data and down_data.get("data") and down_data["data"].get("diff"):
+        for item in down_data["data"]["diff"]:
+            c = safe_float(item.get("f3"))
+            if c <= -9.9:
+                down_count += 1
+            else:
+                break
+
+    if up_count > 0 or down_count > 0:
+        return {"limit_up": up_count, "limit_down": down_count, "source": "eastmoney"}
+    return None
+
+
+def get_em_market_breadth():
+    """沪深两市全市场涨跌家数；失败时 fallback 两融明细 ZDF 估算"""
+    # 1. 全市场涨跌平（上证A指 + 深证A指）
+    full = get_full_market_breadth_from_indices()
+    if full:
+        # 2. 尝试全市场涨跌停
+        limit_counts = get_em_limit_counts()
+        if limit_counts:
+            full["limit_up"] = limit_counts["limit_up"]
+            full["limit_down"] = limit_counts["limit_down"]
+            full["limit_source"] = "eastmoney"
+        else:
+            # fallback: 两融明细估算涨跌停
+            margin = get_breadth_from_margin()
+            if margin:
+                full["limit_up"] = margin["limit_up"]
+                full["limit_down"] = margin["limit_down"]
+                full["limit_source"] = "eastmoney_margin_estimate"
+            else:
+                full["limit_up"] = 0
+                full["limit_down"] = 0
+                full["limit_source"] = "none"
+        return full
+    # 全部 fallback
     return get_breadth_from_margin()
 
 
@@ -1267,7 +1345,11 @@ def generate_html(d):
 
     if breadth:
         source_note = ""
-        if breadth.get("source") == "eastmoney_margin_estimate":
+        if breadth.get("source") == "eastmoney_full_market":
+            source_note = "沪深两市全市场"
+            if breadth.get("limit_source") == "eastmoney_margin_estimate":
+                source_note += " | 涨跌停为两融样本估算"
+        elif breadth.get("source") == "eastmoney_margin_estimate":
             source_note = f"两融标的样本{breadth.get('sample', 0)}只（估算）"
         emo_cards += build_card(
             "涨跌家数", f"{breadth['up']} / {breadth['down']}",
@@ -1543,7 +1625,7 @@ def generate_html(d):
 
 <div class="footer">
 <p>数据来源: 东方财富(push2/datacenter) / 新浪财经 / Yahoo Finance / CoinGecko / Alternative.me | GitHub Actions 每日自动生成 | Cloudflare Pages 托管</p>
-<p>中国股市颜色规则: 涨红跌绿 | 月度宏观数据来自东方财富数据中心API | 涨跌家数在push2受限时使用两融明细ZDF估算 | 生成时间: {NOW_STR}</p>
+<p>中国股市颜色规则: 涨红跌绿 | 月度宏观数据来自东方财富数据中心API | 涨跌家数优先使用上证A指+深证A指全市场统计，涨跌停优先使用push2全市场统计，受限时使用两融明细估算 | 生成时间: {NOW_STR}</p>
 </div>
 
 </div>
