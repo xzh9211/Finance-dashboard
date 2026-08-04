@@ -356,7 +356,7 @@ def get_full_market_breadth_from_indices():
 
 
 def get_em_limit_counts():
-    """获取沪深两市涨停/跌停家数（push2 clist），失败返回 None"""
+    """获取沪深两市涨停/跌停家数（push2 clist），失败返回 None。带 3 次重试。"""
     fs = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
     # 涨停：按涨跌幅降序取前 500，统计 >=9.9% 的数量
     up_url = (
@@ -371,23 +371,29 @@ def get_em_limit_counts():
     up_count = 0
     down_count = 0
 
-    up_data = fetch_json(up_url, headers=EM_HEADERS, timeout=20)
-    if up_data and up_data.get("data") and up_data["data"].get("diff"):
-        for item in up_data["data"]["diff"]:
-            c = safe_float(item.get("f3"))
-            if c >= 9.9:
-                up_count += 1
-            else:
-                break
+    for attempt in range(3):
+        up_data = fetch_json(up_url, headers=EM_HEADERS, timeout=20)
+        if up_data and up_data.get("data") and up_data["data"].get("diff"):
+            for item in up_data["data"]["diff"]:
+                c = safe_float(item.get("f3"))
+                if c >= 9.9:
+                    up_count += 1
+                else:
+                    break
+            break
+        time.sleep(1.0)
 
-    down_data = fetch_json(down_url, headers=EM_HEADERS, timeout=20)
-    if down_data and down_data.get("data") and down_data["data"].get("diff"):
-        for item in down_data["data"]["diff"]:
-            c = safe_float(item.get("f3"))
-            if c <= -9.9:
-                down_count += 1
-            else:
-                break
+    for attempt in range(3):
+        down_data = fetch_json(down_url, headers=EM_HEADERS, timeout=20)
+        if down_data and down_data.get("data") and down_data["data"].get("diff"):
+            for item in down_data["data"]["diff"]:
+                c = safe_float(item.get("f3"))
+                if c <= -9.9:
+                    down_count += 1
+                else:
+                    break
+            break
+        time.sleep(1.0)
 
     if up_count > 0 or down_count > 0:
         return {"limit_up": up_count, "limit_down": down_count, "source": "eastmoney"}
@@ -542,56 +548,52 @@ def get_em_turnover():
 
 
 def get_em_margin():
-    """东方财富融资融券余额：按最新交易日个股明细汇总"""
-    # 先取 1 条拿到最新日期
+    """东方财富融资融券余额：使用 RPTA_WEB_MARGIN_DAILYTRADE 官方每日总量接口，
+    直接获取最近 5 个交易日的融资余额、融券余额、两融余额（单位:亿），
+    并自动计算与上一交易日的差额和变化率。"""
     url = (
         "https://datacenter-web.eastmoney.com/api/data/v1/get"
-        "?reportName=RPTA_WEB_RZRQ_GGMX&columns=DATE&pageNumber=1&pageSize=1"
-        "&sortColumns=DATE&sortTypes=-1"
+        "?reportName=RPTA_WEB_MARGIN_DAILYTRADE&columns=ALL"
+        "&pageNumber=1&pageSize=5"
+        "&sortColumns=STATISTICS_DATE&sortTypes=-1"
     )
-    data = fetch_json(url, headers={"Referer": "https://data.eastmoney.com/rzrq/"})
+    data = fetch_json(
+        url,
+        headers={"Referer": "https://data.eastmoney.com/rzrq/zhtjday.html"},
+        timeout=20,
+    )
     if not data or not data.get("result") or not data["result"].get("data"):
         return None
-    latest_date = data["result"]["data"][0].get("DATE", "")[:10]
-    if not latest_date:
+    rows = data["result"]["data"]
+    if not rows:
         return None
 
-    # 取最新日期前 N 页数据汇总
-    all_rows = []
-    for page in range(1, 13):  # 最多 6000 条，足够覆盖一天
-        url = (
-            "https://datacenter-web.eastmoney.com/api/data/v1/get"
-            "?reportName=RPTA_WEB_RZRQ_GGMX&columns=DATE,RZRQYE,RZYE,RQYE"
-            f"&pageNumber={page}&pageSize=500"
-            "&sortColumns=DATE&sortTypes=-1"
-        )
-        data = fetch_json(url, headers={"Referer": "https://data.eastmoney.com/rzrq/"}, timeout=30)
-        if not data or not data.get("result") or not data["result"].get("data"):
-            break
-        rows = data["result"]["data"]
-        if not rows:
-            break
-        for row in rows:
-            dt = row.get("DATE", "")[:10]
-            if dt != latest_date:
-                break
-            all_rows.append(row)
-        else:
-            continue
-        break
+    cur = rows[0]
+    total = safe_float(cur.get("MARGIN_BALANCE")) * 1e8  # 亿 -> 元
+    rzye = safe_float(cur.get("FIN_BALANCE")) * 1e8
+    rqye = safe_float(cur.get("LOAN_BALANCE")) * 1e8
+    date = (cur.get("STATISTICS_DATE") or "")[:10]
 
-    if not all_rows:
-        return None
+    diff_total = None
+    diff_pct = None
+    prev_date = None
+    if len(rows) >= 2:
+        prev = rows[1]
+        prev_total = safe_float(prev.get("MARGIN_BALANCE")) * 1e8
+        prev_date = (prev.get("STATISTICS_DATE") or "")[:10]
+        if prev_total > 0:
+            diff_total = total - prev_total
+            diff_pct = diff_total / prev_total * 100
 
-    total = sum(safe_float(r.get("RZRQYE", 0)) for r in all_rows)
-    rzye = sum(safe_float(r.get("RZYE", 0)) for r in all_rows)
-    rqye = sum(safe_float(r.get("RQYE", 0)) for r in all_rows)
     return {
         "value": total,
         "rzye": rzye,
         "rqye": rqye,
-        "date": latest_date,
-        "count": len(all_rows),
+        "date": date,
+        "prev_date": prev_date,
+        "diff": diff_total,
+        "diff_pct": diff_pct,
+        "source": "eastmoney_official",
     }
 
 
@@ -1349,6 +1351,8 @@ def generate_html(d):
             source_note = "沪深两市全市场"
             if breadth.get("limit_source") == "eastmoney_margin_estimate":
                 source_note += " | 涨跌停为两融样本估算"
+            elif breadth.get("limit_source") == "none":
+                source_note += " | 涨跌停暂无数据"
         elif breadth.get("source") == "eastmoney_margin_estimate":
             source_note = f"两融标的样本{breadth.get('sample', 0)}只（估算）"
         emo_cards += build_card(
@@ -1400,10 +1404,34 @@ def generate_html(d):
 
     if margin:
         val = margin.get("value", 0) / 1e8
+        rzye = margin.get("rzye", 0) / 1e8
+        rqye = margin.get("rqye", 0) / 1e8
+        diff = margin.get("diff")
+        diff_pct = margin.get("diff_pct")
+        prev_date = margin.get("prev_date", "")
+
+        if diff is not None and diff_pct is not None:
+            if diff > 0:
+                diff_cls, sign, label = "up", "+", "较上日增"
+            elif diff < 0:
+                diff_cls, sign, label = "down", "", "较上日减"
+            else:
+                diff_cls, sign, label = "neutral", "", "与上日持平"
+            change_html = (
+                f'<span class="change {diff_cls}">{label}{abs(diff)/1e8:,.0f}亿 '
+                f'({sign}{diff_pct:.2f}%)</span>'
+            )
+            extra = f'{margin.get("date", "")}（官方总量）'
+            if prev_date:
+                extra += f' · 对比{prev_date}'
+        else:
+            change_html = (
+                f'<span class="change neutral">融资{rzye:,.0f}亿 / 融券{rqye:,.0f}亿</span>'
+            )
+            extra = f'{margin.get("date", "")}（官方总量）'
+
         fund_cards += build_card(
-            "两融余额", f"{val:,.0f}亿",
-            f'<span class="change neutral">融资{margin.get("rzye", 0)/1e8:,.0f}亿 / 融券{margin.get("rqye", 0)/1e8:,.0f}亿</span>',
-            f'{margin.get("date", "")}（按标的证券汇总）')
+            "两融余额", f"{val:,.0f}亿", change_html, extra)
 
     if north:
         if north.get("value") is not None:
@@ -1625,7 +1653,7 @@ def generate_html(d):
 
 <div class="footer">
 <p>数据来源: 东方财富(push2/datacenter) / 新浪财经 / Yahoo Finance / CoinGecko / Alternative.me | GitHub Actions 每日自动生成 | Cloudflare Pages 托管</p>
-<p>中国股市颜色规则: 涨红跌绿 | 月度宏观数据来自东方财富数据中心API | 涨跌家数优先使用上证A指+深证A指全市场统计，涨跌停优先使用push2全市场统计，受限时使用两融明细估算 | 生成时间: {NOW_STR}</p>
+<p>中国股市颜色规则: 涨红跌绿 | 月度宏观数据来自东方财富数据中心API | 涨跌家数使用上证A指(000002)+深证A指(399107)全市场统计 | 两融余额使用东方财富官方日总量(MARGIN_BALANCE)并对比上一交易日 | 生成时间: {NOW_STR}</p>
 </div>
 
 </div>
@@ -1745,7 +1773,10 @@ def main():
     all_data["margin"] = get_em_margin()
     if all_data["margin"]:
         m = all_data["margin"]
-        print(f"   两融余额 {m['date']}: {m['value']/1e8:,.0f}亿 (RZYE={m['rzye']/1e8:,.0f}亿, RQYE={m['rqye']/1e8:,.0f}亿, count={m['count']})")
+        diff_str = ""
+        if m.get("diff") is not None:
+            diff_str = f" | 较{m['prev_date']} {m['diff']/1e8:+,.0f}亿 ({m['diff_pct']:+.2f}%)"
+        print(f"   两融余额 {m['date']}: {m['value']/1e8:,.0f}亿 (融资{m['rzye']/1e8:,.0f}亿 融券{m['rqye']/1e8:,.0f}亿){diff_str}")
 
     # 7. 北向资金
     print(">> 获取北向资金...")
